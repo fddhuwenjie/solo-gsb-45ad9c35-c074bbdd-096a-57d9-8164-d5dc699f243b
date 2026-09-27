@@ -597,7 +597,11 @@ class QuoteResult:
         return sum((s.amount for s in self.segments), ZERO)
 
 
-def _parse_input_intervals(payload_intervals, version: LoadedVersion) -> list[InputInterval]:
+def parse_input_intervals(payload_intervals) -> list[InputInterval]:
+    """Parse the shared usage-interval payload (``/quote``, ``/demand-charge``)
+    into UTC :class:`InputInterval` values: naive times resolve in each
+    interval's own timezone, intervals must have positive length/energy, and
+    no two intervals may overlap."""
     parsed: list[InputInterval] = []
     for idx, item in enumerate(payload_intervals):
         tz = get_zone(item.timezone)
@@ -704,7 +708,7 @@ def quote(version: LoadedVersion, payload_intervals,
           *, validate: bool = True) -> QuoteResult:
     if validate:
         ensure_valid(version)
-    inputs = _parse_input_intervals(payload_intervals, version)
+    inputs = parse_input_intervals(payload_intervals)
 
     lo = min(i.start for i in inputs)
     hi = max(i.end for i in inputs)

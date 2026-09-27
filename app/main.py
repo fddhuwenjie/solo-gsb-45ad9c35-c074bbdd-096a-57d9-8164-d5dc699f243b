@@ -8,7 +8,7 @@ from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
 
-from . import diff, importer, meter, pricing, shiftplan
+from . import demand, diff, importer, meter, pricing, shiftplan
 from .database import engine, init_db
 from .pricing import (
     Q2,
@@ -18,8 +18,13 @@ from .pricing import (
     validate_version,
 )
 from .schemas import (
+    DemandAllocPartOut,
+    DemandAllocationOut,
+    DemandChargeRequest,
+    DemandChargeResponse,
     DiffSegmentOut,
     DiffSideOut,
+    IneligibleWindowOut,
     MeterGapOut,
     MeterIntervalOut,
     MeterReconcileRequest,
@@ -30,6 +35,7 @@ from .schemas import (
     QuoteResponse,
     RuleOut,
     SegmentOut,
+    SelectedWindowOut,
     ShiftPlanRequest,
     ShiftPlanResponse,
     ShiftSegmentOut,
@@ -227,6 +233,70 @@ def post_meter_readings_reconcile(req: MeterReconcileRequest):
                 reason=g.reason,
             )
             for g in result.gaps
+        ],
+    )
+
+
+@app.post("/demand-charge", response_model=DemandChargeResponse,
+          tags=["demand"])
+def post_demand_charge(req: DemandChargeRequest):
+    """按本地午夜对齐的需量窗结算最大需量费用。
+
+    不触碰数据库；所有校验失败都返回统一的 error 响应体。
+    """
+    result = demand.settle(req)
+    tz = result.tz
+    selected = result.selected
+    windows_by_index = {w.index: w for w in result.windows}
+
+    allocations = []
+    for alloc in sorted(result.allocations, key=lambda a: a.interval_index):
+        allocations.append(DemandAllocationOut(
+            interval_index=alloc.interval_index,
+            energy=str(alloc.energy),
+            parts=[
+                DemandAllocPartOut(
+                    window_start=demand.to_utc_z(
+                        windows_by_index[p.window_index].start),
+                    window_end=demand.to_utc_z(
+                        windows_by_index[p.window_index].end),
+                    energy=str(p.energy.quantize(Q6)),
+                )
+                for p in alloc.parts
+            ],
+        ))
+
+    return DemandChargeResponse(
+        timezone=str(tz),
+        window_minutes=result.window_minutes,
+        unit_price=str(result.unit_price),
+        total_energy=str(result.total_energy),
+        window_count=len(result.windows),
+        eligible_window_count=sum(1 for w in result.windows if w.eligible),
+        demand=str(result.demand),
+        fee=str(result.fee),
+        selected_window=SelectedWindowOut(
+            start=demand.to_utc_z(selected.start),
+            end=demand.to_utc_z(selected.end),
+            start_local=selected.start.astimezone(tz).isoformat(),
+            end_local=selected.end.astimezone(tz).isoformat(),
+            duration_seconds=int((selected.end - selected.start)
+                                 .total_seconds()),
+            energy=str(selected.energy.quantize(Q6)),
+            demand=str(result.demand),
+        ),
+        allocations=allocations,
+        ineligible_windows=[
+            IneligibleWindowOut(
+                start=demand.to_utc_z(w.start),
+                end=demand.to_utc_z(w.end),
+                start_local=w.start.astimezone(tz).isoformat(),
+                end_local=w.end.astimezone(tz).isoformat(),
+                duration_seconds=int((w.end - w.start).total_seconds()),
+                covered_seconds=w.covered_micros // 1_000_000,
+                reason=w.reason,
+            )
+            for w in result.windows if not w.eligible
         ],
     )
 
