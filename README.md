@@ -444,6 +444,121 @@ curl -s -X POST localhost:8000/meter-readings/reconcile \
 `total_amount=30.55`（周五 `dst-workday` 与周六 `leisure` 分段计价，
 累计阶梯跨区间共享）。
 
+### `POST /demand-charge`
+
+根据**不等长用量区间**结算**最大需量（maximum demand）费用**（纯计算，
+不触碰数据库）。给出对齐用的 IANA 时区、需量窗时长（**15 / 30 / 60 分钟**）
+与正单价（每 kW），服务端按**本地午夜起算的固定分钟边界**枚举窗口，
+取**平均功率最高**的窗口按六位小数需量计费。`intervals` 与 `/quote`
+完全同格式（可不等长、互不重叠、首尾相接允许）。
+
+请求示例（服务端口 **8000**）：
+
+```bash
+curl -s -X POST localhost:8000/demand-charge -H 'Content-Type: application/json' -d '{
+  "timezone": "America/New_York",
+  "window_minutes": 15,
+  "unit_price": "12.50",
+  "intervals": [
+    {"start": "2024-07-03T16:07:00-04:00", "end": "2024-07-03T16:22:30-04:00",
+     "timezone": "America/New_York", "energy": "3.1"},
+    {"start": "2024-07-03T16:22:30-04:00", "end": "2024-07-03T16:45:00-04:00",
+     "timezone": "America/New_York", "energy": "4.5"},
+    {"start": "2024-07-03T18:00:00-04:00", "end": "2024-07-03T18:30:00-04:00",
+     "timezone": "America/New_York", "energy": "1"}
+  ]
+}'
+```
+
+窗口与夏令时语义：
+
+- 窗口**按每个本地日重新对齐**：以当日本地午夜 `00:00` 的 UTC 时刻为起点，
+  每隔 `window_minutes` 分钟沿 **UTC 时间线递增**取边界，直到次日本地午夜；
+  普通日恰有 `1440/N` 个窗口（60 分钟档 24 个、15 分钟档 96 个）。
+- **春季跳时**（如纽约 2024-03-10，02:00→03:00）整日为 23 个 UTC 小时：
+  15 分钟档得到 92 个等长窗口，缺时区间内**不制造**不存在的本地边界。
+- **秋季回拨**（如纽约 2024-11-03，02:00→01:00）整日为 25 个 UTC 小时：
+  15 分钟档得到 100 个窗口；重复的本地边界（如两个本地 `01:15`，偏移量分别为
+  `-04:00` 与 `-05:00`）对应不同的 UTC 窗口，**分别枚举、分别参评**
+  （响应中用带偏移量的 `start_local` 区分）。
+- 落在 DST 春季缺口或秋季歧义的**朴素时间**与 `/quote` 一样被拒绝
+  （400），请携带明确 UTC 偏移量。
+
+参评与分摊：
+
+- 只有被输入区间（**首尾相接视为连续覆盖**）**完整覆盖**的窗口才参评；
+  仅部分与输入相交的边缘窗口记 `partial_coverage`，完全落在内部缺口内的
+  窗口记 `not_covered`（理论上的非整除碎片记 `incomplete_alignment`）。
+- 跨窗区间按窗口与输入的**实际 UTC 微秒时长**精确比例分摊能量，每段输入
+  独立在六位小数上分摊、舍入残差并入该输入的末切片——因此**逐输入严格
+  能量守恒**（窗口各切片能量之和恰为该输入的申报能量），DST 日自然按
+  23/25 小时计价。
+- 以**未舍入能量**选出平均功率最高的窗口（参评窗口等长，功率与能量同序），
+  **同值时取 UTC 起点最早者**；需量 kW = 窗口能量 ÷ 窗口小时数，
+  需量与费用都按**六位小数四舍五入**计费（`demand_kw`、`amount`）。
+- 费用再按获选窗口内各输入的能量占比分摊（`allocations`），残差并入最后
+  一项，各分摊费用之和严格等于总费用。
+
+响应（节选）：
+
+```json
+{
+  "timezone": "America/New_York",
+  "window_minutes": 15,
+  "unit_price": "12.50",
+  "window_count": 10,
+  "eligible_window_count": 4,
+  "selected_window": {
+    "window_index": 1,
+    "start": "2024-07-03T20:15:00Z",
+    "end": "2024-07-03T20:30:00Z",
+    "start_local": "2024-07-03T16:15:00-04:00",
+    "end_local": "2024-07-03T16:30:00-04:00",
+    "duration_seconds": 900,
+    "energy": "3.000000",
+    "average_power_kw": "12.000000",
+    "allocations": [
+      {"interval_index": 0,
+       "start": "2024-07-03T20:15:00Z", "end": "2024-07-03T20:22:30Z",
+       "start_local": "2024-07-03T16:15:00-04:00",
+       "end_local": "2024-07-03T16:22:30-04:00",
+       "duration_seconds": 450,
+       "energy": "1.500000", "demand_kw": "6.000000", "amount": "75.000000"},
+      {"interval_index": 1,
+       "start": "2024-07-03T20:22:30Z", "end": "2024-07-03T20:30:00Z",
+       "start_local": "2024-07-03T16:22:30-04:00",
+       "end_local": "2024-07-03T16:30:00-04:00",
+       "duration_seconds": 450,
+       "energy": "1.500000", "demand_kw": "6.000000", "amount": "75.000000"}
+    ]
+  },
+  "demand_kw": "12.000000",
+  "amount": "150.000000",
+  "reason_code": null,
+  "reason": null,
+  "excluded_windows": [
+    {"window_index": 0,
+     "start": "2024-07-03T20:00:00Z", "end": "2024-07-03T20:15:00Z",
+     "start_local": "2024-07-03T16:00:00-04:00",
+     "end_local": "2024-07-03T16:15:00-04:00",
+     "duration_seconds": 900, "reasons": ["partial_coverage"]},
+    {"window_index": 3,
+     "start": "2024-07-03T20:45:00Z", "end": "2024-07-03T21:00:00Z",
+     "start_local": "2024-07-03T16:45:00-04:00",
+     "end_local": "2024-07-03T17:00:00-04:00",
+     "duration_seconds": 900, "reasons": ["not_covered"]}
+  ]
+}
+```
+
+获选窗口 `16:15–16:30`（本地）被两段不等长输入各覆盖 7.5 分钟，分摊能量
+各为 1.5 kWh（按各自的实际时长比例），合计 3 kWh → 平均功率 12 kW →
+费用 12 × 12.50 = **150.000000**；逐输入费用各 75.000000，合计严格等于
+总费用。`excluded_windows` 只列出与输入范围相交但未参评的窗口
+（上例已省略其余缺口窗口）；当**没有任何完整窗口**时 HTTP 仍为 200，
+`selected_window` 为 `null`、`demand_kw`/`amount` 为 `0.000000`，
+并给出 `reason_code="no_complete_window"`。
+
 ### `POST /versions/import`
 
 导入一个**完整费率版本**（版本 + 嵌套的 `holidays`、`rules`、`tiers`），
@@ -531,6 +646,7 @@ curl -s -X POST localhost:8000/versions/import -H 'Content-Type: application/jso
 | POST | `/quote-diff` | 两版本对同一组用量区间独立报价并逐段对比（见上） |
 | POST | `/shift-plan` | 两项可移时任务在 8 小时窗口内枚举 30 分钟候选，统一报价选最低费用组合（见上） |
 | POST | `/meter-readings/reconcile` | 累计表计读数对账：排序去重、reset 断列、回卷与采样间隔 gap，产出可直提 `/quote` 的用量区间（见上） |
+| POST | `/demand-charge` | 不等长用量区间按本地午夜对齐的 15/30/60 分钟窗口结算最大需量：DST 感知枚举、按实际时长精确分摊、逐输入能量守恒（见上） |
 
 ## 错误处理
 
@@ -601,16 +717,20 @@ pip install pytest httpx
 python -m pytest -q
 ```
 
-测试使用内存 SQLite（`StaticPool`），共 82 个用例，覆盖跨日、春秋 DST、
+测试使用内存 SQLite（`StaticPool`），共 106 个用例，覆盖跨日、春秋 DST、
 节假日/调休、跨档切分、重叠与缺口报错、版本对比（原子段对账、
 rule/tier/单价变化原因、币种拒绝），以及 `/shift-plan` 的候选枚举、
 跨任务共享累计阶梯、同价字典序决胜、规则缺口只淘汰对应候选、
 结构错误直接报错与全部输入校验路径，`/versions/import` 的
 规范化与摘要稳定性（列表乱序/等价写法）、幂等重放与同 code 冲突、
-字段错误定位、单事务原子性与导入后立即可用性，以及
+字段错误定位、单事务原子性与导入后立即可用性，
 `/meter-readings/reconcile` 的 UTC 排序与原始下标、同时刻去重/冲突、
 一次回卷、reset 断列、采样间隔 gap、静止读数、对账不变量与
-接力 `/quote` 的端到端报价。
+接力 `/quote` 的端到端报价，以及 `/demand-charge` 的 15/30/60 分钟
+本地午夜对齐、春秋 DST 窗口计数（92/100 个 15 分钟窗、重复本地边界
+分别成窗）、跨窗按实际微秒时长精确分摊与逐输入能量守恒、同功率取
+最早 UTC 起点、首尾相接连续覆盖、边缘/缺口窗口原因、六位小数计费、
+无完整窗口的 `no_complete_window` 与全部输入校验路径。
 
 ## 目录结构
 
@@ -622,6 +742,7 @@ app/
   diff.py        # 版本对比：原子段切分、差额与变化原因
   shiftplan.py  # 移时排程：30 分钟枚举 + 统一报价选优
   meter.py      # 表计对账：排序去重、reset 断列、回卷与采样间隔 gap
+  demand.py     # 最大需量：本地午夜对齐窗口、DST 枚举、精确分摊与选优
   importer.py   # 版本导入：规范化、SHA-256 摘要、定位校验、单事务落库
   database.py   # SQLAlchemy 模型与预置版本数据
 tests/          # pytest 端到端测试

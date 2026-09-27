@@ -3,12 +3,13 @@ from __future__ import annotations
 
 from contextlib import asynccontextmanager
 from decimal import ROUND_HALF_UP
+from zoneinfo import ZoneInfo
 
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
 
-from . import diff, importer, meter, pricing, shiftplan
+from . import demand, diff, importer, meter, pricing, shiftplan
 from .database import engine, init_db
 from .pricing import (
     Q2,
@@ -18,8 +19,13 @@ from .pricing import (
     validate_version,
 )
 from .schemas import (
+    DemandAllocationOut,
+    DemandChargeRequest,
+    DemandChargeResponse,
+    DemandWindowOut,
     DiffSegmentOut,
     DiffSideOut,
+    ExcludedWindowOut,
     MeterGapOut,
     MeterIntervalOut,
     MeterReconcileRequest,
@@ -228,6 +234,77 @@ def post_meter_readings_reconcile(req: MeterReconcileRequest):
             )
             for g in result.gaps
         ],
+    )
+
+
+@app.post("/demand-charge", response_model=DemandChargeResponse,
+          tags=["quote"])
+def post_demand_charge(req: DemandChargeRequest):
+    """按本地午夜对齐的固定分钟需量窗结算最大需量费用。
+
+    纯计算、不触碰数据库：窗口沿 UTC 时间线递增枚举（DST 重复的本地边界
+    分别成窗），能量按实际时长精确分摊；只有被输入完整覆盖的窗口参评。
+    """
+    result = demand.settle(req)
+    tz = ZoneInfo(result.timezone)
+
+    def _local(dt):
+        return dt.astimezone(tz).isoformat()
+
+    def _seconds(a, b):
+        return int((b - a).total_seconds())
+
+    selected = None
+    if result.winner is not None:
+        w = result.winner
+        selected = DemandWindowOut(
+            window_index=w.index,
+            start=demand.to_utc_z(w.start),
+            end=demand.to_utc_z(w.end),
+            start_local=_local(w.start),
+            end_local=_local(w.end),
+            duration_seconds=_seconds(w.start, w.end),
+            energy=str(w.energy.quantize(Q6)),
+            average_power_kw=str(result.demand_kw),
+            allocations=[
+                DemandAllocationOut(
+                    interval_index=a.interval_index,
+                    start=demand.to_utc_z(a.start),
+                    end=demand.to_utc_z(a.end),
+                    start_local=_local(a.start),
+                    end_local=_local(a.end),
+                    duration_seconds=a.microseconds // 1_000_000,
+                    energy=str(a.energy.quantize(Q6)),
+                    demand_kw=str(a.demand_kw),
+                    amount=str(a.amount),
+                )
+                for a in result.allocations
+            ],
+        )
+    excluded = [
+        ExcludedWindowOut(
+            window_index=w.index,
+            start=demand.to_utc_z(w.start),
+            end=demand.to_utc_z(w.end),
+            start_local=_local(w.start),
+            end_local=_local(w.end),
+            duration_seconds=int((w.end - w.start).total_seconds()),
+            reasons=w.reasons,
+        )
+        for w in result.windows if not w.eligible
+    ]
+    return DemandChargeResponse(
+        timezone=result.timezone,
+        window_minutes=result.window_minutes,
+        unit_price=str(result.unit_price),
+        window_count=result.window_count,
+        eligible_window_count=result.eligible_count,
+        selected_window=selected,
+        demand_kw=str(result.demand_kw.quantize(Q6)),
+        amount=str(result.amount.quantize(Q6)),
+        reason_code=result.reason_code,
+        reason=result.reason,
+        excluded_windows=excluded,
     )
 
 

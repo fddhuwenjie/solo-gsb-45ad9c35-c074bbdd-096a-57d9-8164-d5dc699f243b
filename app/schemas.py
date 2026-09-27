@@ -382,3 +382,96 @@ class MeterReconcileResponse(BaseModel):
     )
     intervals: list[MeterIntervalOut]
     gaps: list[MeterGapOut]
+
+
+# ------------------------------------------------------------- demand charge
+
+
+class DemandChargeRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    timezone: str = Field(
+        ..., description="窗口对齐所用的 IANA 时区，如 America/New_York"
+    )
+    window_minutes: int = Field(
+        ..., description="需量窗固定时长（分钟），仅允许 15 / 30 / 60"
+    )
+    unit_price: Decimal = Field(
+        ..., gt=0, allow_inf_nan=False,
+        description="最大需量正单价（每 kW，按六位小数需量计费）",
+    )
+    intervals: list[QuoteIntervalIn] = Field(
+        ..., min_length=1,
+        description="与 /quote 相同的用量区间格式（可不等长、不重叠、"
+        "首尾相接允许）；能量按实际时长精确分摊到各窗口",
+    )
+
+    @field_validator("window_minutes")
+    @classmethod
+    def _allowed_window(cls, value):
+        if value not in (15, 30, 60):
+            raise ValueError("window_minutes 仅允许 15 / 30 / 60")
+        return value
+
+
+class DemandAllocationOut(BaseModel):
+    interval_index: int = Field(
+        ..., description="获选窗口内该分摊片段所属输入区间的原始下标"
+    )
+    start: str = Field(..., description="片段 UTC 起点（Z 后缀）")
+    end: str = Field(..., description="片段 UTC 终点（Z 后缀）")
+    start_local: str
+    end_local: str
+    duration_seconds: int
+    energy: str = Field(..., description="按实际时长分摊到该输入的能量（六位小数）")
+    demand_kw: str = Field(..., description="该分摊片段对应的平均功率（六位小数）")
+    amount: str = Field(
+        ..., description="按能量占比分摊的费用（六位小数；合计严格等于费用）"
+    )
+
+
+class DemandWindowOut(BaseModel):
+    window_index: int
+    start: str = Field(..., description="窗口 UTC 起点（Z 后缀）")
+    end: str = Field(..., description="窗口 UTC 终点（Z 后缀）")
+    start_local: str
+    end_local: str
+    duration_seconds: int
+    energy: str = Field(..., description="窗口内各输入分摊能量之和（六位小数）")
+    average_power_kw: str = Field(..., description="窗口平均功率 kW（六位小数）")
+    allocations: list[DemandAllocationOut]
+
+
+class ExcludedWindowOut(BaseModel):
+    window_index: int
+    start: str
+    end: str
+    start_local: str
+    end_local: str
+    duration_seconds: int
+    reasons: list[str] = Field(
+        ...,
+        description="未参评原因：partial_coverage=仅被输入部分覆盖；"
+        "not_covered=完全落在输入缺口/边缘；incomplete_alignment="
+        "本地日 UTC 跨度不足一个完整窗口的碎片",
+    )
+
+
+class DemandChargeResponse(BaseModel):
+    timezone: str
+    window_minutes: int
+    unit_price: str
+    window_count: int = Field(..., description="与输入范围相交的对齐窗口总数")
+    eligible_window_count: int = Field(..., description="被完整覆盖、参评的窗口数")
+    selected_window: DemandWindowOut | None = Field(
+        None, description="平均功率最高的窗口；同值取 UTC 起点最早者；"
+        "无完整窗口时为 null"
+    )
+    demand_kw: str = Field(..., description="计费需量 kW（六位小数四舍五入）")
+    amount: str = Field(..., description="需量费用（六位小数四舍五入）")
+    reason_code: str | None = Field(
+        None, description="无完整参评窗口时为 no_complete_window"
+    )
+    reason: str | None
+    excluded_windows: list[ExcludedWindowOut]
+

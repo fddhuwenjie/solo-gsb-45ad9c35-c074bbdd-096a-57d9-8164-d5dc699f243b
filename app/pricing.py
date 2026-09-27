@@ -597,7 +597,16 @@ class QuoteResult:
         return sum((s.amount for s in self.segments), ZERO)
 
 
-def _parse_input_intervals(payload_intervals, version: LoadedVersion) -> list[InputInterval]:
+def parse_usage_intervals(payload_intervals,
+                          version: LoadedVersion | None = None
+                          ) -> list[InputInterval]:
+    """Validate shared ``QuoteIntervalIn``-style payloads into UTC intervals.
+
+    Intervals are sorted by start; overlapping inputs are rejected. The
+    ``version`` argument is unused by the interval grammar itself (it is
+    accepted for call sites that historically passed it) and may be omitted,
+    e.g. by endpoints that do not price against a stored tariff version.
+    """
     parsed: list[InputInterval] = []
     for idx, item in enumerate(payload_intervals):
         tz = get_zone(item.timezone)
@@ -704,7 +713,7 @@ def quote(version: LoadedVersion, payload_intervals,
           *, validate: bool = True) -> QuoteResult:
     if validate:
         ensure_valid(version)
-    inputs = _parse_input_intervals(payload_intervals, version)
+    inputs = parse_usage_intervals(payload_intervals, version)
 
     lo = min(i.start for i in inputs)
     hi = max(i.end for i in inputs)
